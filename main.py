@@ -8,6 +8,9 @@ from PyQt5.QtCore import QTimer, QBuffer, pyqtSignal, QObject, pyqtSlot
 from PyQt5.QtGui import QImage
 from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QTextEdit, QVBoxLayout, QWidget, QLabel
 
+import requests
+import uuid
+from google.cloud import texttospeech_v1
 import google.generativeai as genai
 from google.generativeai.types import Content, Part, Blob, LiveConnectConfig, SpeechConfig, VoiceConfig, PrebuiltVoiceConfig
 
@@ -38,7 +41,36 @@ class GeminiApp(QMainWindow):
         self.status_label = QLabel('Status: Not connected')
         self.layout.addWidget(self.status_label)
 
+        self.last_gemini_text_response = "" # To store the latest text from Gemini
+
+        # TTS UI
+        self.tts_button = QPushButton('Synthesize Gemini Text to Audio')
+        self.tts_button.clicked.connect(self.handle_tts_button)
+        self.tts_button.setEnabled(False) # Disabled until Gemini provides text
+        self.layout.addWidget(self.tts_button)
+
+        # HeyGem UI
+        self.heygem_avatar_video_path_label = QLabel('Path to HeyGem Avatar Video (e.g., avatar.mp4):')
+        self.layout.addWidget(self.heygem_avatar_video_path_label)
+        self.heygem_avatar_video_path_input = QLineEdit()
+        self.heygem_avatar_video_path_input.setPlaceholderText("Enter path to silent avatar video for HeyGem")
+        self.layout.addWidget(self.heygem_avatar_video_path_input)
+        self.heygem_avatar_video_path_input.textChanged.connect(self._check_heygem_readiness)
+
+        self.generate_heygem_video_button = QPushButton('Generate HeyGem Video')
+        self.generate_heygem_video_button.clicked.connect(self.handle_generate_heygem_video)
+        self.layout.addWidget(self.generate_heygem_video_button)
+        self.generate_heygem_video_button.setEnabled(False) # Initially disabled
+
+        self.heygem_status_label = QLabel('HeyGem Status: Idle')
+        self.layout.addWidget(self.heygem_status_label)
+
+        self.last_tts_audio_path = None
         self.is_session_active = False
+
+        self.heygem_polling_timer = QTimer(self)
+        self.heygem_polling_timer.timeout.connect(self.poll_heygem_status)
+        self.current_heygem_task_code = None
 
         self.samplerate = 16000
         self.channels = 1
@@ -71,12 +103,53 @@ class GeminiApp(QMainWindow):
             self.message_received_signal.emit("System", "system_message", "Warning: Google Cloud ADC might not be configured. See README for auth setup.")
             self.status_label.setText('Status: Warning - Check Authentication')
 
+    def synthesize_text_to_audio(self, text_input, output_filename="gemini_tts_output.mp3"):
+        try:
+            # Instantiate a client
+            client = texttospeech_v1.TextToSpeechClient()
+
+            # Set the text input to be synthesized
+            synthesis_input = texttospeech_v1.SynthesisInput(text=text_input)
+
+            # Build the voice request, select the language code ("en-US") and the ssml voice gender ("neutral")
+            # You can customize voice parameters here. For a standard voice:
+            voice = texttospeech_v1.VoiceSelectionParams(
+                language_code="en-US",
+                name="en-US-Standard-C", # A standard, neutral voice
+                ssml_gender=texttospeech_v1.SsmlVoiceGender.NEUTRAL,
+            )
+
+            # Select the type of audio file you want returned
+            audio_config = texttospeech_v1.AudioConfig(
+                audio_encoding=texttospeech_v1.AudioEncoding.MP3
+            )
+
+            # Perform the text-to-speech request on the text input with the selected
+            # voice parameters and audio file type
+            self.message_received_signal.emit("System", "system_message", f"Synthesizing '{text_input[:30]}...' to audio.")
+            response = client.synthesize_speech(
+                request={"input": synthesis_input, "voice": voice, "audio_config": audio_config}
+            )
+
+            # The response's audio_content is binary.
+            with open(output_filename, "wb") as out:
+                out.write(response.audio_content)
+                logger.info(f'Audio content written to file "{output_filename}"')
+            self.message_received_signal.emit("System", "system_message", f'Audio content written to file "{output_filename}"')
+            return output_filename
+        except Exception as e:
+            logger.error(f"TTS Synthesis failed: {e}", exc_info=True)
+            self.message_received_signal.emit("Error", "error_message", f"TTS Synthesis failed: {e}")
+            return None
+
     @pyqtSlot(str, str, str)
     def _handle_received_message(self, role, message_type, message):
         if message_type == "transcript":
             self.append_message(f"{role} (transcript)", message)
         elif message_type == "gemini_response":
             self.append_message(role, message)
+            self.last_gemini_text_response = message
+            self.tts_button.setEnabled(True)
         elif message_type == "system_message":
             self.append_message(role, message) # System messages also go to main log
         elif message_type == "error_message":
@@ -394,11 +467,199 @@ class GeminiApp(QMainWindow):
         self.stop_async_loop()
         super().closeEvent(event)
 
+    def handle_tts_button(self):
+        if self.last_gemini_text_response:
+            self.message_received_signal.emit("System", "system_message", "TTS button clicked.")
+            # Call the actual TTS function (already implemented in Step 2)
+            # Example: self.synthesize_text_to_audio(self.last_gemini_text_response)
+            # For now, just log and update status
+            output_audio_file = self.synthesize_text_to_audio(self.last_gemini_text_response)
+            if output_audio_file:
+                self.heygem_status_label.setText(f"HeyGem Status: Audio ready at {output_audio_file}")
+                self.last_tts_audio_path = output_audio_file
+            else:
+                self.heygem_status_label.setText("HeyGem Status: TTS failed.")
+                self.last_tts_audio_path = None
+        else:
+            self.message_received_signal.emit("System", "system_message", "TTS button clicked, but no Gemini text available.")
+            self.heygem_status_label.setText("HeyGem Status: No Gemini text for TTS.")
+        self._check_heygem_readiness()
+
+    def handle_generate_heygem_video(self):
+        self.message_received_signal.emit("System", "system_message", "Generate HeyGem Video button clicked.")
+        avatar_video_path = self.heygem_avatar_video_path_input.text()
+        tts_audio_file_path = self.last_tts_audio_path
+        if not tts_audio_file_path:
+            self.heygem_status_label.setText("HeyGem Status: TTS audio is not available. Synthesize audio first.")
+            self.message_received_signal.emit("Error", "user_error", "TTS audio is not available. Please synthesize audio from Gemini text first.")
+            return
+
+        if not avatar_video_path:
+            self.heygem_status_label.setText("HeyGem Status: Avatar video path is missing.")
+            self.message_received_signal.emit("Error", "user_error", "Avatar video path is missing for HeyGem.")
+            return
+
+        # Placeholder for Step 4 logic:
+        self.heygem_status_label.setText(f"HeyGem Status: Preparing to generate video with {avatar_video_path} and {tts_audio_file_path}...")
+        task_code = self.call_heygem_video_synthesis(tts_audio_file_path, avatar_video_path)
+        if task_code:
+            self.start_heygem_polling(task_code)
+        else:
+            # Error message already set by call_heygem_video_synthesis
+            pass # Or set a generic "Submission failed, check logs."
+
+    def call_heygem_video_synthesis(self, audio_path, avatar_video_path):
+        # Note: Assumes HeyGem's /easy/submit API is running at http://127.0.0.1:8383.
+        # The audio_path and avatar_video_path must be accessible by the HeyGem Docker service.
+        try:
+            self.heygem_status_label.setText("HeyGem Status: Submitting video synthesis request...")
+            self.message_received_signal.emit("System", "heygem_status", "Submitting video synthesis request...")
+
+            # Ensure paths are absolute or accessible by HeyGem's service
+            # For local files, HeyGem docs imply D:\heygem_data as a base for some things.
+            # However, its API examples for video synthesis just show "audio_url" and "video_url".
+            # Assuming these can be local paths accessible by the HeyGem docker instances.
+            # The user needs to ensure HeyGem services can access these paths.
+            # For simplicity, we'll pass them as provided.
+
+            task_code = str(uuid.uuid4()) # Generate a unique code for this task
+            self.current_heygem_task_code = task_code # Store for polling
+
+            payload = {
+                "audio_url": audio_path,    # Path to the TTS audio file
+                "video_url": avatar_video_path, # Path to the silent avatar video
+                "code": task_code,          # Unique key for the task
+                "chaofen": 0,               # Fixed value from HeyGem docs
+                "watermark_switch": 0,      # Fixed value from HeyGem docs
+                "pn": 1                     # Fixed value from HeyGem docs
+            }
+
+            # From HeyGem docs: http://127.0.0.1:8383/easy/submit
+            heygem_submit_url = "http://127.0.0.1:8383/easy/submit"
+
+            logger.info(f"Calling HeyGem submit API: {heygem_submit_url} with payload: {payload}")
+            response = requests.post(heygem_submit_url, json=payload, timeout=30) # 30s timeout
+            response.raise_for_status()  # Raise an exception for bad status codes
+
+            response_json = response.json()
+            logger.info(f"HeyGem submit API response: {response_json}")
+
+            # Expected response format (based on typical API design, HeyGem docs are minimal here):
+            # {"code": 0, "message": "success", "data": {"taskCode": "your_task_code"}} or similar
+            # Or if it directly returns the taskCode or a success status.
+            # Let's assume success if no exception and check common success indicators.
+            if response_json.get("code") == 0 or response_json.get("status") == "success" or response.status_code == 200:
+                self.heygem_status_label.setText(f"HeyGem Status: Task submitted. Code: {task_code}. Polling...")
+                self.message_received_signal.emit("System", "heygem_status", f"Task submitted. Code: {task_code}. Polling...")
+                return task_code
+            else:
+                error_msg = response_json.get("message", "Unknown error from HeyGem submit API.")
+                logger.error(f"HeyGem submit API returned an error: {error_msg} - Full response: {response_json}")
+                self.heygem_status_label.setText(f"HeyGem Status: Submit failed - {error_msg}")
+                self.message_received_signal.emit("Error", "heygem_error", f"Submit failed: {error_msg}")
+                self.current_heygem_task_code = None
+                return None
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"HeyGem submit API request failed: {e}", exc_info=True)
+            self.heygem_status_label.setText(f"HeyGem Status: Submit request failed - {e}")
+            self.message_received_signal.emit("Error", "heygem_error", f"Submit request error: {e}")
+            self.current_heygem_task_code = None
+            return None
+        except Exception as e:
+            logger.error(f"Error in call_heygem_video_synthesis: {e}", exc_info=True)
+            self.heygem_status_label.setText(f"HeyGem Status: Error during submission - {e}")
+            self.message_received_signal.emit("Error", "heygem_error", f"Submit error: {e}")
+            self.current_heygem_task_code = None
+            return None
+
+    def start_heygem_polling(self, task_code):
+        if task_code:
+            self.current_heygem_task_code = task_code
+            self.heygem_polling_timer.start(5000) # Poll every 5 seconds
+            logger.info(f"Started polling for HeyGem task: {task_code}")
+            self.heygem_status_label.setText(f"HeyGem Status: Polling for task {task_code}...")
+        else:
+            logger.warning("No task code provided to start polling.")
+            self.heygem_status_label.setText(f"HeyGem Status: Invalid task code for polling.")
+
+
+    def poll_heygem_status(self):
+        # Note: Assumes HeyGem's /easy/query API is running at http://127.0.0.1:8383.
+        # The JSON response structure (fields like 'status', 'data', 'video_url', 'progress')
+        # is based on common API patterns and HeyGem's limited documentation.
+        # This may need adjustment based on actual responses from a live HeyGem instance.
+        if not self.current_heygem_task_code:
+            logger.warning("Polling attempt without a task code.")
+            self.heygem_polling_timer.stop()
+            return
+
+        try:
+            task_code = self.current_heygem_task_code
+            # From HeyGem docs: http://127.0.0.1:8383/easy/query?code=${taskCode}
+            heygem_query_url = f"http://127.0.0.1:8383/easy/query?code={task_code}"
+
+            logger.debug(f"Polling HeyGem status for task {task_code} at {heygem_query_url}")
+            response = requests.get(heygem_query_url, timeout=10)
+            response.raise_for_status()
+
+            response_json = response.json()
+            logger.debug(f"HeyGem query API response: {response_json}")
+
+            # Based on typical API design, response might look like:
+            # {"code": 0, "data": {"status": "processing/completed/failed", "video_url": "path/to/video.mp4"}}
+            # The exact structure needs to be inferred or tested with a live HeyGem instance.
+            # Assuming a structure like: {"status": "completed", "data": {"video_path": "..."}} or {"progress": "100%"}
+
+            status = response_json.get("status", response_json.get("pro", "")).lower() # 'pro' for progress if 'status' not found
+            data = response_json.get("data", {})
+
+            if status == "completed" or status == "success" or str(data.get("progress")) == "100":
+                self.heygem_polling_timer.stop()
+                video_output_path = data.get("video_url", data.get("videoPath", data.get("outputPath", "Not provided")))
+                self.heygem_status_label.setText(f"HeyGem Status: Video ready at {video_output_path}")
+                self.message_received_signal.emit("System", "heygem_status", f"Video ready at {video_output_path}")
+                logger.info(f"HeyGem task {task_code} completed. Video at: {video_output_path}")
+                self.current_heygem_task_code = None
+            elif status == "failed" or response_json.get("code") != 0 : # many APIs use code 0 for success
+                self.heygem_polling_timer.stop()
+                error_msg = data.get("message", "Task failed or error in response.")
+                self.heygem_status_label.setText(f"HeyGem Status: Task {task_code} failed - {error_msg}")
+                self.message_received_signal.emit("Error", "heygem_error", f"Task {task_code} failed: {error_msg}")
+                logger.error(f"HeyGem task {task_code} failed: {error_msg} - Full response: {response_json}")
+                self.current_heygem_task_code = None
+            else:
+                # Still processing
+                progress_msg = f"Task {task_code} processing. Status: {status}, Progress: {data.get('progress', 'N/A')}"
+                self.heygem_status_label.setText(f"HeyGem Status: {progress_msg}")
+                logger.info(progress_msg)
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"HeyGem query API request failed for task {self.current_heygem_task_code}: {e}", exc_info=True)
+            self.heygem_status_label.setText(f"HeyGem Status: Query request failed - {e}")
+            # Optionally stop polling on repeated errors, or let it continue
+        except Exception as e:
+            logger.error(f"Error polling HeyGem status for task {self.current_heygem_task_code}: {e}", exc_info=True)
+            self.heygem_status_label.setText(f"HeyGem Status: Error during polling - {e}")
+            # Optionally stop polling
+            self.heygem_polling_timer.stop()
+            self.current_heygem_task_code = None
+
+    def _check_heygem_readiness(self):
+        tts_ready = bool(self.last_tts_audio_path)
+        avatar_path_entered = bool(self.heygem_avatar_video_path_input.text().strip())
+
+        if tts_ready and avatar_path_entered:
+            self.generate_heygem_video_button.setEnabled(True)
+        else:
+            self.generate_heygem_video_button.setEnabled(False)
+
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     # Potentially set app name for logger if it uses it by default
     # QCoreApplication.setApplicationName("GeminiLiveApp")
     # QCoreApplication.setOrganizationName("MyOrg")
+    from PyQt5.QtWidgets import QLineEdit # Added QLineEdit here
     main_window = GeminiApp()
     main_window.show()
     logger.info("Application started.")

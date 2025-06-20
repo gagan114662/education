@@ -14,6 +14,7 @@ google-cloud-bigquery==3.34.0
 google-cloud-core==2.4.3
 google-cloud-resource-manager==1.14.2
 google-cloud-storage==2.19.0
+google-cloud-texttospeech==2.14.0
 google-crc32c==1.7.1
 google-genai==1.21.1
 google-resumable-media==2.7.2
@@ -47,7 +48,7 @@ PyQt5==5.15.11
 PyQt5-Qt5==5.15.17
 PyQt5_sip==12.17.0
 python-dateutil==2.9.0.post0
-requests==2.32.4
+requests==2.31.0
 rsa==4.9.1
 scikit-learn==1.7.0
 scipy==1.15.3
